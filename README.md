@@ -107,3 +107,13 @@ insufficient-funds failure. No signing key is written to disk.
 `registry-entry.json` contains the tiny third-party entry for the elizaOS
 registry. The plugin source and release lifecycle live entirely in this
 repository.
+
+## Releasing
+
+Publishing is driven by the `version` field in `package.json`. To cut a release,
+bump that version in a pull request. When the PR merges to `main`, the publish
+workflow validates the package and, if the version is not already on npm,
+publishes it and pushes a matching `v<version>` git tag. Merges that do not
+change the version are no-ops for npm, so an unrelated merge never triggers a
+publish. A published GitHub Release and manual `workflow_dispatch` remain
+supported as alternative triggers.

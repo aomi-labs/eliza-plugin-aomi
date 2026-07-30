@@ -1,6 +1,6 @@
 {
 	"name": "@aomi-labs/eliza-plugin-aomi",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Aomi on-chain agent integration for elizaOS with wallet-backed confirmation and execution",
 	"type": "module",
 	"main": "dist/index.js",
