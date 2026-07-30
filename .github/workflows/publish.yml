@@ -1,14 +1,22 @@
 name: Publish npm package
 
+# Publishing is driven by the version in package.json. When a commit lands on
+# main (typically a merged PR that bumped the version), this workflow publishes
+# that version to npm — but only if it is not already published, so ordinary
+# pushes and re-runs are safe no-ops. A published GitHub Release and manual
+# dispatch remain supported as alternative triggers.
 on:
+  push:
+    branches:
+      - main
   release:
     types:
       - published
   workflow_dispatch:
 
 permissions:
-  contents: read
-  id-token: write
+  contents: write # create the release tag
+  id-token: write # npm provenance
 
 concurrency:
   group: npm-publish
@@ -20,19 +28,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.5
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      - name: Resolve version
+        id: version
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already published; nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$name@$version is not published; will publish."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.version.outputs.publish == 'true'
+        with:
+          bun-version: 1.3.5
+
       - name: Install
+        if: steps.version.outputs.publish == 'true'
         run: bun install --frozen-lockfile
 
       - name: Validate
+        if: steps.version.outputs.publish == 'true'
         run: |
           bun run lint:check
           bun run typecheck
@@ -40,6 +65,21 @@ jobs:
           bun run build
 
       - name: Publish
+        if: steps.version.outputs.publish == 'true'
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag release
+        if: steps.version.outputs.publish == 'true' && github.event_name == 'push'
+        env:
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists; skipping."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
