@@ -15,7 +15,14 @@ export async function registerAomiDirectRoute(
 ): Promise<void> {
 	const core = await import("@elizaos/core");
 	const register = Reflect.get(core, "registerDirectActionRoutingRule");
-	if (typeof register !== "function") return;
+	if (typeof register !== "function") {
+		// The direct-route registry is not present in every @elizaos/core build.
+		// Log rather than silently no-op so an inactive route is observable.
+		runtime.logger?.debug(
+			"[aomi] registerDirectActionRoutingRule unavailable; explicit-Aomi direct routing is inactive.",
+		);
+		return;
+	}
 	register(runtime, {
 		id: "plugin-aomi.explicit-request",
 		actionNames: ["AOMI"],

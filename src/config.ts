@@ -23,17 +23,24 @@ function optionalString(
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function positiveInteger(
-	value: string | number | boolean | object | null | undefined,
-	fallback: number,
-): number {
+function readChainId(runtime: IAgentRuntime, fallback: number): number {
+	const value = runtime.getSetting("AOMI_CHAIN_ID");
+	if (value === undefined || value === null) return fallback;
+	if (typeof value === "string" && value.trim().length === 0) return fallback;
+	// `Number` (unlike parseInt) rejects trailing garbage and accepts 0x forms,
+	// so "0x89" resolves to 137 while "sepolia" / "137x" fail closed.
 	const parsed =
-		typeof value === "number"
-			? value
-			: typeof value === "string"
-				? Number.parseInt(value, 10)
-				: Number.NaN;
-	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+		typeof value === "number" ? value : Number(String(value).trim());
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+		// error-policy:J2 A malformed operator setting must fail loudly, not
+		// silently default to Ethereum mainnet.
+		throw new AomiError("AOMI_CHAIN_ID must be a positive integer chain id.", {
+			code: "AOMI_INVALID_CHAIN_ID",
+			context: { value: String(value) },
+			severity: "fatal",
+		});
+	}
+	return parsed;
 }
 
 export function readAomiConfig(runtime: IAgentRuntime): AomiConfig {
@@ -57,7 +64,7 @@ export function readAomiConfig(runtime: IAgentRuntime): AomiConfig {
 		apiKey: optionalString(runtime, "AOMI_API_KEY"),
 		app: optionalString(runtime, "AOMI_APP") ?? "default",
 		applicationId: optionalString(runtime, "AOMI_APPLICATION_ID"),
-		chainId: positiveInteger(runtime.getSetting("AOMI_CHAIN_ID"), 1),
+		chainId: readChainId(runtime, 1),
 		evmRpcUrl: optionalString(runtime, "AOMI_EVM_RPC_URL"),
 	};
 }

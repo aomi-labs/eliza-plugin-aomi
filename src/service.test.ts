@@ -201,4 +201,93 @@ describe("AomiService", () => {
 			service.submit(String(ROOM_ID), String(ENTITY_ID), "retry request"),
 		).rejects.toMatchObject({ code: "AOMI_REQUEST_FAILED" });
 	});
+
+	it("recovers a room when the Aomi backend stops responding", async () => {
+		const { runtime } = fakeRuntime();
+		const session = new FakeAomiSession(null, undefined, false);
+		const service = new AomiService(runtime, CONFIG, {
+			createSession: () => session,
+			executeWallet: async () => {
+				throw new Error("wallet execution should not run");
+			},
+		});
+
+		const pending = service.submit(
+			String(ROOM_ID),
+			String(ENTITY_ID),
+			"read-only request",
+		);
+		await Promise.resolve();
+		for (let i = 0; i < 20; i += 1) session.emitPollError();
+
+		await expect(pending).rejects.toMatchObject({
+			code: "AOMI_REQUEST_FAILED",
+		});
+		expect(service.pending(String(ROOM_ID))).toBeNull();
+	});
+
+	it("does not let a rejection hijack an in-flight confirmation", async () => {
+		const { runtime } = fakeRuntime();
+		const session = new FakeAomiSession(EVM_REQUEST);
+		let releaseExecution!: () => void;
+		const executionGate = new Promise<void>((resolve) => {
+			releaseExecution = resolve;
+		});
+		const service = new AomiService(runtime, CONFIG, {
+			createSession: () => session,
+			executeWallet: async () => {
+				await executionGate;
+				return { kind: "transaction", txHash: "0xinflight" };
+			},
+		});
+
+		await service.submit(
+			String(ROOM_ID),
+			String(ENTITY_ID),
+			"prepare transfer",
+		);
+		const confirming = service.confirm(String(ROOM_ID), String(ENTITY_ID));
+		await Promise.resolve();
+
+		await expect(
+			service.reject(String(ROOM_ID), String(ENTITY_ID)),
+		).rejects.toMatchObject({ code: "AOMI_SETTLEMENT_IN_FLIGHT" });
+
+		releaseExecution();
+		const completed = await confirming;
+		expect(completed.status).toBe("completed");
+		expect(session.rejected).toHaveLength(0);
+		expect(session.resolved).toHaveLength(1);
+	});
+
+	it("only confirms the exact pending request id", async () => {
+		const { runtime } = fakeRuntime();
+		const session = new FakeAomiSession(EVM_REQUEST);
+		let executions = 0;
+		const service = new AomiService(runtime, CONFIG, {
+			createSession: () => session,
+			executeWallet: async () => {
+				executions += 1;
+				return { kind: "transaction", txHash: "0xexact" };
+			},
+		});
+
+		await service.submit(
+			String(ROOM_ID),
+			String(ENTITY_ID),
+			"prepare transfer",
+		);
+		await expect(
+			service.confirm(String(ROOM_ID), String(ENTITY_ID), "not-the-pending-id"),
+		).rejects.toMatchObject({ code: "AOMI_CONFIRMATION_REQUEST_MISMATCH" });
+		expect(executions).toBe(0);
+
+		const completed = await service.confirm(
+			String(ROOM_ID),
+			String(ENTITY_ID),
+			EVM_REQUEST.id,
+		);
+		expect(completed.status).toBe("completed");
+		expect(executions).toBe(1);
+	});
 });

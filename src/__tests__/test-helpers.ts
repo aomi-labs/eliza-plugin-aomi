@@ -45,7 +45,8 @@ export class FakeAomiSession implements AomiSession {
 	readonly synced: Record<string, unknown>[] = [];
 	failResolveCount = 0;
 
-	private listeners = new Set<(requests: WalletRequest[]) => void>();
+	private walletListeners = new Set<(requests: WalletRequest[]) => void>();
+	private errorListeners = new Set<(payload: { error: unknown }) => void>();
 	private requests: WalletRequest[];
 	private completionResolve!: (result: SendResult) => void;
 	private completionReject!: (error: unknown) => void;
@@ -86,7 +87,8 @@ export class FakeAomiSession implements AomiSession {
 	}
 
 	close(): void {
-		this.listeners.clear();
+		this.walletListeners.clear();
+		this.errorListeners.clear();
 	}
 
 	getPendingRequests(): WalletRequest[] {
@@ -98,19 +100,41 @@ export class FakeAomiSession implements AomiSession {
 	}
 
 	on(
-		_event: "wallet_requests_changed",
+		event: "wallet_requests_changed",
 		handler: (requests: WalletRequest[]) => void,
+	): () => void;
+	on(
+		event: "error",
+		handler: (payload: { error: unknown }) => void,
+	): () => void;
+	on(
+		event: "wallet_requests_changed" | "error",
+		handler:
+			| ((requests: WalletRequest[]) => void)
+			| ((payload: { error: unknown }) => void),
 	): () => void {
-		this.listeners.add(handler);
-		return () => this.listeners.delete(handler);
+		if (event === "error") {
+			const errorHandler = handler as (payload: { error: unknown }) => void;
+			this.errorListeners.add(errorHandler);
+			return () => this.errorListeners.delete(errorHandler);
+		}
+		const walletHandler = handler as (requests: WalletRequest[]) => void;
+		this.walletListeners.add(walletHandler);
+		return () => this.walletListeners.delete(walletHandler);
 	}
 
 	failCompletion(error: unknown): void {
 		this.completionReject(error);
 	}
 
+	/** Simulate a client poll failure (the client emits "error", never rejects). */
+	emitPollError(error: unknown = new Error("backend unreachable")): void {
+		for (const listener of this.errorListeners) listener({ error });
+	}
+
 	private emit(): void {
-		for (const listener of this.listeners) listener(this.getPendingRequests());
+		for (const listener of this.walletListeners)
+			listener(this.getPendingRequests());
 	}
 
 	private createCompletion(): Promise<SendResult> {
