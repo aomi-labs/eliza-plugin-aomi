@@ -13,13 +13,26 @@ import {
 	requireConfirmation,
 	type State,
 } from "@elizaos/core";
-import { toAomiError } from "./errors.js";
+import { AomiError, toAomiError } from "./errors.js";
 import { AOMI_DIRECT_ROUTE_TAG } from "./routing.js";
 import { AomiService } from "./service.js";
 import type { AomiBoundary } from "./types.js";
 
 const AOMI_CONFIRM_ACTION = "AOMI_WALLET";
 const FOLLOW_UP_CAPABLE_ACTION_TAG = "follow-up-capable";
+// Only an explicit affirmative signs, and only an explicit rejection tears the
+// request down. The `(?!.*\?)` guard keeps a question ("ok, but what's the fee?")
+// from matching either, so it is re-prompted instead of silently acted on.
+const AOMI_CONFIRM_REGEX =
+	/^(?!.*\?)\s*(y|yes|yep|yeah|yup|ok|okay|confirm|confirmed|approve|approved|go ahead|proceed|sign it|send it|do it)\b/i;
+const AOMI_CANCEL_REGEX =
+	/^(?!.*\?)\s*(n|no|nope|nah|cancel|reject|decline|stop|abort|never mind|nevermind)\b/i;
+
+function isExplicitRejection(message: Memory): boolean {
+	const text =
+		typeof message.content.text === "string" ? message.content.text : "";
+	return AOMI_CANCEL_REGEX.test(text);
+}
 
 function serviceFromRuntime(runtime: IAgentRuntime): AomiService | null {
 	return runtime.getService<AomiService>(AomiService.serviceType);
@@ -111,25 +124,41 @@ async function handleBoundary(
 		return completedResult(boundary);
 	}
 
-	const decision = await requireConfirmation({
+	const confirmationArgs = {
 		runtime,
 		message,
 		actionName: AOMI_CONFIRM_ACTION,
 		pendingKey: `${roomId}:${boundary.request.id}`,
 		prompt: boundary.preview,
 		callback,
+		confirmRegex: AOMI_CONFIRM_REGEX,
+		cancelRegex: AOMI_CANCEL_REGEX,
 		metadata: {
 			roomId,
 			initiatingSubjectId,
 			requestId: boundary.request.id,
 			requestKind: boundary.request.kind,
 		},
-	});
+	};
+	const decision = await requireConfirmation(confirmationArgs);
 	if (decision.status === "pending") {
 		return pendingResult(boundary);
 	}
 	if (decision.status === "cancelled") {
-		const next = await service.reject(roomId, initiatingSubjectId);
+		// core maps every non-affirmative reply to "cancelled"; only an explicit
+		// rejection may tear down the prepared request. Anything else re-arms the
+		// confirmation (the decision consumed the record) and keeps the request
+		// pending, so a clarifying question is never destructive.
+		if (!isExplicitRejection(message)) {
+			await requireConfirmation(confirmationArgs);
+			return pendingResult(boundary);
+		}
+		const next = await service.reject(
+			roomId,
+			initiatingSubjectId,
+			undefined,
+			boundary.request.id,
+		);
 		if (next.status === "wallet_required") {
 			return handleBoundary(
 				runtime,
@@ -158,7 +187,11 @@ async function handleBoundary(
 		};
 	}
 
-	const next = await service.confirm(roomId, initiatingSubjectId);
+	const next = await service.confirm(
+		roomId,
+		initiatingSubjectId,
+		boundary.request.id,
+	);
 	return handleBoundary(
 		runtime,
 		message,
@@ -172,7 +205,10 @@ async function handleBoundary(
 
 function failureResult(error: unknown): ActionResult {
 	const normalized = toAomiError(error, "AOMI_ACTION_FAILED");
-	const known = normalized.code.startsWith("AOMI_");
+	// Surface a message only for our own classified errors. A raw viem/RPC/backend
+	// error can embed RPC URLs (with API keys), request bodies, and signed
+	// payloads, so it must be replaced with a generic message.
+	const known = error instanceof AomiError;
 	const text = known
 		? normalized.message
 		: "Aomi could not complete the request. Check the plugin configuration and try again.";
@@ -249,7 +285,19 @@ export const aomiAction: Action = {
 		}
 
 		const roomId = String(message.roomId);
-		const initiatingSubjectId = String(message.entityId);
+		const initiatingSubjectId = String(message.entityId ?? "").trim();
+		if (
+			initiatingSubjectId.length === 0 ||
+			initiatingSubjectId === "null" ||
+			initiatingSubjectId === "undefined"
+		) {
+			return failureResult(
+				new AomiError("Aomi requires an authenticated initiating subject.", {
+					code: "AOMI_INITIATING_SUBJECT_REQUIRED",
+					severity: "fatal",
+				}),
+			);
+		}
 		try {
 			const existing = service.pendingFor(roomId, initiatingSubjectId);
 			const boundary = existing

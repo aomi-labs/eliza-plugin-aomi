@@ -31,12 +31,25 @@ import {
 
 export const AOMI_SERVICE_TYPE = "aomi" as const;
 
+// Stop rejecting a backend that keeps re-staging unexecutable requests instead of
+// looping forever, and treat sustained poll failures (~10s at the client's 500ms
+// interval) as an unreachable backend so a dead turn cannot wedge the room.
+const MAX_UNSUPPORTED_REJECTIONS = 5;
+const MAX_CONSECUTIVE_POLL_ERRORS = 20;
+
+type SettlementOperation = "confirmation" | "rejection";
+
+interface PendingSettlement {
+	readonly operation: SettlementOperation;
+	readonly promise: Promise<AomiBoundary>;
+}
+
 interface PendingState {
 	readonly request: WalletRequest;
 	readonly preview: string;
 	readonly initiatingSubjectId: string;
 	execution?: Promise<WalletRequestResult>;
-	settlement?: Promise<AomiBoundary>;
+	settlement?: PendingSettlement;
 }
 
 interface RoomConversation {
@@ -118,7 +131,8 @@ export class AomiService extends Service {
 			});
 		}
 
-		const conversation = this.conversation(roomId);
+		const reusedConversation = this.conversations.has(roomId);
+		let conversation = this.conversation(roomId);
 		if (conversation.completion || conversation.pending) {
 			throw new AomiError(
 				"This room already has an Aomi operation awaiting completion.",
@@ -128,6 +142,18 @@ export class AomiService extends Service {
 					severity: "ephemeral",
 				},
 			);
+		}
+
+		// A fresh turn must not inherit a wallet request left in a reused session by
+		// a prior aborted turn; recreate the session so nothing binds this new prompt
+		// (and initiating subject) to a stale, previously-staged request.
+		if (
+			reusedConversation &&
+			conversation.session.getPendingRequests().length > 0
+		) {
+			conversation.session.close();
+			this.conversations.delete(roomId);
+			conversation = this.conversation(roomId);
 		}
 
 		const normalizedSubjectId = initiatingSubjectId.trim();
@@ -155,6 +181,7 @@ export class AomiService extends Service {
 	async confirm(
 		roomId: string,
 		initiatingSubjectId: string,
+		requestId?: string,
 	): Promise<AomiBoundary> {
 		const conversation = this.requiredConversation(roomId);
 		const pending = this.requiredPending(
@@ -162,30 +189,17 @@ export class AomiService extends Service {
 			initiatingSubjectId,
 			"confirmation",
 		);
-
-		if (pending.settlement) {
-			return pending.settlement;
-		}
-
-		const settlement = this.confirmPending(roomId, conversation, pending);
-		pending.settlement = settlement;
-		try {
-			return await settlement;
-		} catch (error) {
-			if (
-				conversation.pending === pending &&
-				pending.settlement === settlement
-			) {
-				pending.settlement = undefined;
-			}
-			throw error;
-		}
+		this.assertRequestId(roomId, pending, requestId);
+		return this.settle(conversation, pending, "confirmation", () =>
+			this.confirmPending(roomId, conversation, pending),
+		);
 	}
 
 	async reject(
 		roomId: string,
 		initiatingSubjectId: string,
 		reason = "User rejected the wallet request.",
+		requestId?: string,
 	): Promise<AomiBoundary> {
 		const conversation = this.requiredConversation(roomId);
 		const pending = this.requiredPending(
@@ -193,29 +207,83 @@ export class AomiService extends Service {
 			initiatingSubjectId,
 			"rejection",
 		);
-
-		if (pending.settlement) {
-			return pending.settlement;
-		}
-
-		const settlement = this.rejectPending(
-			roomId,
-			conversation,
-			pending,
-			reason,
+		this.assertRequestId(roomId, pending, requestId);
+		return this.settle(conversation, pending, "rejection", () =>
+			this.rejectPending(roomId, conversation, pending, reason),
 		);
-		pending.settlement = settlement;
+	}
+
+	/**
+	 * Memoizes the in-flight settlement so concurrent confirmations share one
+	 * wallet execution, but keeps confirmation and rejection distinct: a rejection
+	 * must never resolve to a confirmation's outcome (or the caller would report a
+	 * broadcast transaction as "rejected"). A failed settlement is cleared so the
+	 * user can retry.
+	 */
+	private async settle(
+		conversation: RoomConversation,
+		pending: PendingState,
+		operation: SettlementOperation,
+		run: () => Promise<AomiBoundary>,
+	): Promise<AomiBoundary> {
+		const existing = pending.settlement;
+		if (existing) {
+			if (existing.operation === operation) {
+				return existing.promise;
+			}
+			throw new AomiError(
+				operation === "rejection"
+					? "This Aomi wallet request is already being confirmed."
+					: "This Aomi wallet request is already being rejected.",
+				{
+					code: "AOMI_SETTLEMENT_IN_FLIGHT",
+					context: { operation },
+					severity: "ephemeral",
+				},
+			);
+		}
+		const promise = run();
+		pending.settlement = { operation, promise };
 		try {
-			return await settlement;
+			return await promise;
 		} catch (error) {
 			if (
 				conversation.pending === pending &&
-				pending.settlement === settlement
+				pending.settlement?.promise === promise
 			) {
 				pending.settlement = undefined;
 			}
 			throw error;
 		}
+	}
+
+	private assertRequestId(
+		roomId: string,
+		pending: PendingState,
+		requestId: string | undefined,
+	): void {
+		if (requestId !== undefined && pending.request.id !== requestId) {
+			throw new AomiError(
+				"This Aomi confirmation does not match the pending wallet request.",
+				{
+					code: "AOMI_CONFIRMATION_REQUEST_MISMATCH",
+					context: {
+						roomId,
+						requestId,
+						pendingRequestId: pending.request.id,
+					},
+					severity: "fatal",
+				},
+			);
+		}
+	}
+
+	private toPendingOperation(pending: PendingState): AomiPendingOperation {
+		return {
+			request: pending.request,
+			preview: pending.preview,
+			executionReady: pending.execution !== undefined,
+		};
 	}
 
 	pendingFor(
@@ -230,11 +298,7 @@ export class AomiService extends Service {
 			pending,
 			"access",
 		);
-		return {
-			request: pending.request,
-			preview: pending.preview,
-			executionReady: pending.execution !== undefined,
-		};
+		return this.toPendingOperation(pending);
 	}
 
 	private async confirmPending(
@@ -242,12 +306,29 @@ export class AomiService extends Service {
 		conversation: RoomConversation,
 		pending: PendingState,
 	): Promise<AomiBoundary> {
+		// Retain the execution promise before resolving with Aomi so a failed
+		// callback retry cannot broadcast twice.
 		pending.execution ??= this.dependencies.executeWallet(
 			this.runtime,
 			this.aomiConfig,
 			pending.request,
 		);
-		const execution = await pending.execution;
+		let execution: WalletRequestResult;
+		try {
+			execution = await pending.execution;
+		} catch (error) {
+			// Provably pre-broadcast failures (our own validation errors, never the
+			// post-broadcast AOMI_SOLANA_TRANSACTION_FAILED) are safe to retry, so
+			// drop the cached rejection. Ambiguous transport failures stay cached to
+			// preserve the no-double-broadcast guarantee.
+			if (
+				error instanceof AomiError &&
+				error.code !== "AOMI_SOLANA_TRANSACTION_FAILED"
+			) {
+				pending.execution = undefined;
+			}
+			throw error;
+		}
 		await conversation.session.resolve(pending.request.id, execution);
 		if (conversation.pending === pending) {
 			conversation.pending = undefined;
@@ -310,28 +391,42 @@ export class AomiService extends Service {
 
 	pending(roomId: string): AomiPendingOperation | null {
 		const pending = this.conversations.get(roomId)?.pending;
-		return pending
-			? {
-					request: pending.request,
-					preview: pending.preview,
-					executionReady: pending.execution !== undefined,
-				}
-			: null;
+		return pending ? this.toPendingOperation(pending) : null;
 	}
 
-	status(roomId: string): AomiServiceStatus {
+	status(roomId: string, requestingSubjectId?: string): AomiServiceStatus {
+		const addresses = this.walletAddresses();
+		const pending = this.conversations.get(roomId)?.pending;
+		// Only surface the pending preview to its initiator so a shared room cannot
+		// leak another user's staged transaction into the planner context.
+		const visiblePending =
+			pending &&
+			(requestingSubjectId === undefined ||
+				pending.initiatingSubjectId === requestingSubjectId)
+				? this.toPendingOperation(pending)
+				: null;
+		return {
+			apiUrl: this.aomiConfig.apiUrl,
+			app: this.aomiConfig.app,
+			walletReady: Boolean(addresses.evm || addresses.solana),
+			evmAddress: addresses.evm,
+			solanaAddress: addresses.solana,
+			pending: visiblePending,
+		};
+	}
+
+	private walletAddresses(): {
+		readonly evm: string | null;
+		readonly solana: string | null;
+	} {
 		const service = this.runtime.getService(WALLET_BACKEND_SERVICE_TYPE);
 		const backend = (
 			service as unknown as WalletBackendServiceLike | null
 		)?.getWalletBackendOrNull();
 		const addresses = backend?.getAddresses();
 		return {
-			apiUrl: this.aomiConfig.apiUrl,
-			app: this.aomiConfig.app,
-			walletReady: Boolean(addresses?.evm || addresses?.solana),
-			evmAddress: addresses?.evm ?? null,
-			solanaAddress: addresses?.solana?.toBase58() ?? null,
-			pending: this.pending(roomId),
+			evm: addresses?.evm ?? null,
+			solana: addresses?.solana?.toBase58() ?? null,
 		};
 	}
 
@@ -381,15 +476,11 @@ export class AomiService extends Service {
 	}
 
 	private walletUserState(): Record<string, unknown> {
-		const service = this.runtime.getService(WALLET_BACKEND_SERVICE_TYPE);
-		const backend = (
-			service as unknown as WalletBackendServiceLike | null
-		)?.getWalletBackendOrNull();
-		const addresses = backend?.getAddresses();
-		const connected = Boolean(addresses?.evm || addresses?.solana);
+		const addresses = this.walletAddresses();
+		const connected = Boolean(addresses.evm || addresses.solana);
 		return {
 			connection: { is_connected: connected },
-			...(addresses?.evm
+			...(addresses.evm
 				? {
 						evm: {
 							address: addresses.evm,
@@ -398,10 +489,10 @@ export class AomiService extends Service {
 						},
 					}
 				: {}),
-			...(addresses?.solana
+			...(addresses.solana
 				? {
 						svm: {
-							address: addresses.solana.toBase58(),
+							address: addresses.solana,
 							cluster: this.solanaCluster(),
 							capabilities: [
 								"solana:signTransaction",
@@ -422,9 +513,16 @@ export class AomiService extends Service {
 			: "solana:mainnet";
 	}
 
+	private resetConversation(conversation: RoomConversation): void {
+		conversation.completion = undefined;
+		conversation.initiatingSubjectId = undefined;
+		conversation.pending = undefined;
+	}
+
 	private async waitForBoundary(
 		roomId: string,
 		conversation: RoomConversation,
+		rejectionBudget = MAX_UNSUPPORTED_REJECTIONS,
 	): Promise<AomiBoundary> {
 		const completion = conversation.completion;
 		if (!completion) {
@@ -435,63 +533,107 @@ export class AomiService extends Service {
 			});
 		}
 
+		type Boundary =
+			| { readonly kind: "completed"; readonly result: SendResult }
+			| { readonly kind: "wallet"; readonly request: WalletRequest };
+
 		const existing = conversation.session.getPendingRequests()[0];
-		const boundary = existing
-			? { kind: "wallet" as const, request: existing }
-			: await new Promise<
-					| { readonly kind: "completed"; readonly result: SendResult }
-					| { readonly kind: "wallet"; readonly request: WalletRequest }
-				>((resolve, reject) => {
+		const boundary: Boundary = existing
+			? { kind: "wallet", request: existing }
+			: await new Promise<Boundary>((resolve, reject) => {
 					let settled = false;
-					let unsubscribe: () => void = () => undefined;
-					const settle = (
-						value:
-							| { readonly kind: "completed"; readonly result: SendResult }
-							| { readonly kind: "wallet"; readonly request: WalletRequest },
-					) => {
+					let pollErrors = 0;
+					const unsubscribes: Array<() => void> = [];
+					const cleanup = () => {
+						for (const unsubscribe of unsubscribes) unsubscribe();
+					};
+					const settle = (value: Boundary) => {
 						if (settled) return;
 						settled = true;
-						unsubscribe();
+						cleanup();
 						resolve(value);
 					};
-					unsubscribe = conversation.session.on(
-						"wallet_requests_changed",
-						(requests) => {
+					const fail = (cause: unknown) => {
+						if (settled) return;
+						settled = true;
+						cleanup();
+						// The delegated turn is dead; clear room state so it is not left
+						// permanently busy and a later submit can start fresh.
+						this.resetConversation(conversation);
+						reject(
+							new AomiError("Aomi did not complete the delegated request.", {
+								code: "AOMI_REQUEST_FAILED",
+								context: { roomId },
+								cause,
+								severity: "ephemeral",
+							}),
+						);
+					};
+					unsubscribes.push(
+						conversation.session.on("wallet_requests_changed", (requests) => {
+							pollErrors = 0;
 							if (requests[0]) settle({ kind: "wallet", request: requests[0] });
-						},
+						}),
+					);
+					// The Aomi client never rejects send(); it only emits "error" on poll
+					// failures. Treat a sustained run of them as an unreachable backend so
+					// an outage cannot hang the handler forever and wedge the room.
+					unsubscribes.push(
+						conversation.session.on("error", () => {
+							pollErrors += 1;
+							if (pollErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+								fail(
+									new Error(
+										`Aomi backend was unreachable across ${pollErrors} consecutive polls.`,
+									),
+								);
+							}
+						}),
 					);
 					completion.then(
 						(result) => settle({ kind: "completed", result }),
-						(cause) => {
-							if (settled) return;
-							settled = true;
-							unsubscribe();
-							conversation.completion = undefined;
-							conversation.initiatingSubjectId = undefined;
-							conversation.pending = undefined;
-							reject(
-								new AomiError("Aomi did not complete the delegated request.", {
-									code: "AOMI_REQUEST_FAILED",
-									context: { roomId },
-									cause,
-									severity: "ephemeral",
-								}),
-							);
-						},
+						(cause) => fail(cause),
 					);
 				});
 
 		if (boundary.kind === "completed") {
-			conversation.completion = undefined;
-			conversation.initiatingSubjectId = undefined;
-			conversation.pending = undefined;
+			this.resetConversation(conversation);
 			return { status: "completed", result: boundary.result };
 		}
 
-		const unsupported = walletRequestSupportError(boundary.request);
+		const unsupported = walletRequestSupportError(
+			boundary.request,
+			this.walletAddresses(),
+		);
 		if (unsupported) {
-			await conversation.session.reject(boundary.request.id, unsupported);
-			return this.waitForBoundary(roomId, conversation);
+			if (rejectionBudget <= 0) {
+				this.resetConversation(conversation);
+				throw new AomiError(
+					"Aomi kept returning wallet requests this wallet cannot execute.",
+					{
+						code: "AOMI_UNSUPPORTED_REQUEST_LOOP",
+						context: { roomId },
+						severity: "ephemeral",
+					},
+				);
+			}
+			try {
+				await conversation.session.reject(boundary.request.id, unsupported);
+			} catch (cause) {
+				// A failed rejection must not leave the room wedged with an
+				// unclearable completion; reset so the room can recover.
+				this.resetConversation(conversation);
+				throw new AomiError(
+					"Aomi could not reject an unsupported wallet request.",
+					{
+						code: "AOMI_REQUEST_FAILED",
+						context: { roomId },
+						cause,
+						severity: "ephemeral",
+					},
+				);
+			}
+			return this.waitForBoundary(roomId, conversation, rejectionBudget - 1);
 		}
 
 		const preview = walletRequestPreview(boundary.request);

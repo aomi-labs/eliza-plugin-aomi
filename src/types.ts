@@ -26,6 +26,10 @@ export interface AomiSession {
 		event: "wallet_requests_changed",
 		handler: (requests: WalletRequest[]) => void,
 	): () => void;
+	on(
+		event: "error",
+		handler: (payload: { error: unknown }) => void,
+	): () => void;
 }
 
 export type AomiSessionFactory = (

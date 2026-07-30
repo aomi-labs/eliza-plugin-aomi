@@ -1,7 +1,7 @@
 /**
  * Proves the action cannot execute a wallet request until a separate user confirmation turn.
  */
-import type { ActionResult, HandlerOptions } from "@elizaos/core";
+import type { ActionResult, HandlerOptions, Memory } from "@elizaos/core";
 import { describe, expect, it } from "vitest";
 import {
 	EVM_REQUEST,
@@ -138,6 +138,97 @@ describe("AOMI action confirmation", () => {
 		)) as ActionResult;
 		expect(authorized.success).toBe(true);
 		expect(authorized.data?.status).toBe("completed");
+		expect(executions).toBe(1);
+	});
+
+	it("does not leak raw execution errors into user-facing text", async () => {
+		const { runtime, services } = fakeRuntime();
+		const session = new FakeAomiSession(EVM_REQUEST);
+		const service = new AomiService(
+			runtime,
+			{ apiUrl: "https://api.aomi.dev", app: "default", chainId: 8453 },
+			{
+				createSession: () => session,
+				executeWallet: async () => {
+					throw new Error(
+						"RPC https://SECRET_KEY@node.example failed: reverted 0xdeadbeef",
+					);
+				},
+			},
+		);
+		services.set(AomiService.serviceType, service);
+
+		await aomiAction.handler(runtime, memory("Prepare a transfer."));
+		const failed = (await aomiAction.handler(
+			runtime,
+			memory("yes"),
+		)) as ActionResult;
+
+		expect(failed.success).toBe(false);
+		expect(failed.userFacingText).not.toContain("SECRET_KEY");
+		expect(failed.userFacingText).not.toContain("node.example");
+		expect(failed.userFacingText).toMatch(/could not complete the request/i);
+		expect(failed.data?.errorCode).toBe("AOMI_ACTION_FAILED");
+	});
+
+	it("rejects a wallet request with no authenticated initiating subject", async () => {
+		const { runtime, services } = fakeRuntime();
+		const session = new FakeAomiSession(EVM_REQUEST);
+		const service = new AomiService(
+			runtime,
+			{ apiUrl: "https://api.aomi.dev", app: "default", chainId: 8453 },
+			{
+				createSession: () => session,
+				executeWallet: async () => ({ kind: "transaction", txHash: "0x0" }),
+			},
+		);
+		services.set(AomiService.serviceType, service);
+
+		const noSubject = {
+			roomId: ROOM_ID,
+			content: { text: "Ask Aomi to swap." },
+		} as unknown as Memory;
+		const result = (await aomiAction.handler(runtime, noSubject, undefined, {
+			parameters: { prompt: "swap" },
+		} as HandlerOptions)) as ActionResult;
+
+		expect(result.success).toBe(false);
+		expect(result.data?.errorCode).toBe("AOMI_INITIATING_SUBJECT_REQUIRED");
+	});
+
+	it("keeps the request pending when the reply is a clarifying question", async () => {
+		const { runtime, services } = fakeRuntime();
+		const session = new FakeAomiSession(EVM_REQUEST);
+		let executions = 0;
+		const service = new AomiService(
+			runtime,
+			{ apiUrl: "https://api.aomi.dev", app: "default", chainId: 8453 },
+			{
+				createSession: () => session,
+				executeWallet: async () => {
+					executions += 1;
+					return { kind: "transaction", txHash: "0xquestion" };
+				},
+			},
+		);
+		services.set(AomiService.serviceType, service);
+
+		await aomiAction.handler(runtime, memory("Prepare a transfer."));
+		const question = (await aomiAction.handler(
+			runtime,
+			memory("how much gas is that?"),
+		)) as ActionResult;
+
+		expect(question.data?.status).toBe("awaiting_confirmation");
+		expect(session.rejected).toHaveLength(0);
+		expect(executions).toBe(0);
+		expect(service.pending(String(ROOM_ID))).not.toBeNull();
+
+		const yes = (await aomiAction.handler(
+			runtime,
+			memory("yes"),
+		)) as ActionResult;
+		expect(yes.data?.status).toBe("completed");
 		expect(executions).toBe(1);
 	});
 });

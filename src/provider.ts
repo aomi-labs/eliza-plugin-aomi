@@ -14,7 +14,7 @@ export const aomiProvider: Provider = {
 		"Aomi on-chain delegation status and pending confirmed wallet request",
 	contexts: ["finance", "crypto", "wallet", "onchain"],
 	contextGate: { anyOf: ["finance", "crypto", "wallet", "onchain"] },
-	roleGate: { minRole: "OWNER" },
+	roleGate: { minRole: "ADMIN" },
 	cacheStable: false,
 	cacheScope: "turn",
 	dynamic: true,
@@ -29,7 +29,10 @@ export const aomiProvider: Provider = {
 			};
 		}
 
-		const status = service.status(String(message.roomId));
+		const status = service.status(
+			String(message.roomId),
+			String(message.entityId),
+		);
 		const lines = [
 			"## Aomi",
 			`Endpoint: ${status.apiUrl}`,

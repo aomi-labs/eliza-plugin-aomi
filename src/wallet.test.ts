@@ -278,6 +278,138 @@ describe("Aomi wallet previews", () => {
 		);
 	});
 
+	it("blocks bidi-control message spoofing but allows tabs", () => {
+		// U+202E RIGHT-TO-LEFT OVERRIDE, built by code point so the source stays
+		// free of an invisible bidi control character.
+		const spoofed = `Send 1 SOL to ${String.fromCodePoint(0x202e)}reterp`;
+		const bidi: WalletRequest = {
+			id: "sol-bidi",
+			kind: "solana_sign_message",
+			timestamp: 1,
+			payload: {
+				message: Buffer.from(spoofed, "utf8").toString("base64"),
+				cluster: "solana:devnet",
+			},
+		};
+		expect(walletRequestSupportError(bidi)).toMatch(
+			/Opaque message signing is blocked/i,
+		);
+		const tabbed: WalletRequest = {
+			...bidi,
+			id: "sol-tab",
+			payload: {
+				...bidi.payload,
+				message: Buffer.from("Amount:\t1 SOL", "utf8").toString("base64"),
+			},
+		};
+		expect(walletRequestSupportError(tabbed)).toBeNull();
+		expect(walletRequestPreview(tabbed)).toContain("Amount:");
+	});
+
+	it("rejects a foreign-owned Solana transfer before confirmation", () => {
+		const wallet = Keypair.generate();
+		const foreign = Keypair.generate();
+		const transaction = new Transaction({
+			feePayer: foreign.publicKey,
+			recentBlockhash: "11111111111111111111111111111111",
+		}).add(
+			SystemProgram.transfer({
+				fromPubkey: foreign.publicKey,
+				toPubkey: Keypair.generate().publicKey,
+				lamports: 1,
+			}),
+		);
+		const request: WalletRequest = {
+			id: "sol-foreign",
+			kind: "solana_sign",
+			timestamp: 1,
+			payload: {
+				unsignedTx: transaction
+					.serialize({ requireAllSignatures: false, verifySignatures: false })
+					.toString("base64"),
+				cluster: "solana:devnet",
+			},
+		};
+		expect(
+			walletRequestSupportError(request, {
+				evm: null,
+				solana: wallet.publicKey.toBase58(),
+			}),
+		).toMatch(/not fully owned/i);
+		expect(
+			walletRequestSupportError(request, {
+				evm: null,
+				solana: foreign.publicKey.toBase58(),
+			}),
+		).toBeNull();
+	});
+
+	it("refuses to sign a Solana transaction with a second required signer", async () => {
+		const wallet = Keypair.generate();
+		const other = Keypair.generate();
+		const transaction = new Transaction({
+			feePayer: wallet.publicKey,
+			recentBlockhash: "11111111111111111111111111111111",
+		})
+			.add(
+				SystemProgram.transfer({
+					fromPubkey: wallet.publicKey,
+					toPubkey: Keypair.generate().publicKey,
+					lamports: 1,
+				}),
+			)
+			.add(
+				SystemProgram.transfer({
+					fromPubkey: other.publicKey,
+					toPubkey: Keypair.generate().publicKey,
+					lamports: 1,
+				}),
+			);
+		const request: WalletRequest = {
+			id: "sol-multisig",
+			kind: "solana_sign",
+			timestamp: 1,
+			payload: {
+				unsignedTx: transaction
+					.serialize({ requireAllSignatures: false, verifySignatures: false })
+					.toString("base64"),
+				cluster: "solana:devnet",
+			},
+		};
+		let signCalls = 0;
+		const walletService = {
+			getWalletBackend: () => ({
+				getAddresses: () => ({ evm: null, solana: wallet.publicKey }),
+				getEvmAccount: () => {
+					throw new Error("EVM is not configured.");
+				},
+				getSolanaSigner: () => ({
+					publicKey: wallet.publicKey,
+					signTransaction: async (value: Transaction) => {
+						signCalls += 1;
+						return value;
+					},
+					signMessage: async (message: Uint8Array) => message,
+				}),
+			}),
+			getWalletBackendOrNull: () => null,
+		};
+		const runtime = {
+			getService: (serviceType: string) =>
+				serviceType === WALLET_BACKEND_SERVICE_TYPE ? walletService : null,
+			getSetting: () => undefined,
+		} as unknown as IAgentRuntime;
+
+		await expect(
+			executeWalletRequest(
+				runtime,
+				{ apiUrl: "https://api.aomi.dev", app: "default", chainId: 8453 },
+				request,
+			),
+		).rejects.toMatchObject({ code: "AOMI_SOLANA_SIGNER_MISMATCH" });
+		expect(signCalls).toBe(0);
+	});
+
 	it("rejects malformed base64 before a Solana confirmation can be shown", () => {
 		const request: WalletRequest = {
 			id: "sol-invalid",

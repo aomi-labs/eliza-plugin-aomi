@@ -188,7 +188,9 @@ function evmRpcUrl(
 ): string {
 	const perChain = runtime.getSetting(`EVM_RPC_URL_${chain.id}`);
 	if (typeof perChain === "string" && perChain.trim()) return perChain.trim();
-	if (config.evmRpcUrl) return config.evmRpcUrl;
+	// The single global override only applies to the configured default chain;
+	// applying it to every chain would route cross-chain requests to the wrong RPC.
+	if (config.evmRpcUrl && chain.id === config.chainId) return config.evmRpcUrl;
 	const defaultUrl = chain.rpcUrls.default.http[0];
 	if (!defaultUrl) {
 		throw new AomiError(`No RPC URL is available for EVM chain ${chain.id}.`, {
@@ -350,12 +352,18 @@ interface DecodedSolanaTransfer {
 	readonly lamports: bigint;
 }
 
+type ParsedSolanaTransaction =
+	| { readonly kind: "legacy"; readonly tx: Transaction }
+	| { readonly kind: "versioned"; readonly tx: VersionedTransaction };
+
 interface SolanaTransactionInspection {
 	readonly bytes: Uint8Array;
 	readonly digest: string;
 	readonly feePayer: string;
 	readonly instructionCount: number;
 	readonly transfers: readonly DecodedSolanaTransfer[];
+	readonly requiredSignatures: number;
+	readonly transaction: ParsedSolanaTransaction;
 }
 
 function formatSol(lamports: bigint): string {
@@ -372,6 +380,8 @@ function inspectSolanaInstructions(
 	bytes: Uint8Array,
 	feePayer: string | undefined,
 	instructions: readonly TransactionInstruction[],
+	requiredSignatures: number,
+	transaction: ParsedSolanaTransaction,
 ): SolanaTransactionInspection {
 	if (!feePayer) {
 		throw new AomiError(
@@ -446,6 +456,8 @@ function inspectSolanaInstructions(
 		feePayer,
 		instructionCount: instructions.length,
 		transfers,
+		requiredSignatures,
+		transaction,
 	};
 }
 
@@ -459,6 +471,8 @@ function inspectSolanaTransaction(
 			bytes,
 			transaction.feePayer?.toBase58(),
 			transaction.instructions,
+			transaction.signatures.length,
+			{ kind: "legacy", tx: transaction },
 		);
 	} catch (legacyCause) {
 		if (
@@ -488,6 +502,8 @@ function inspectSolanaTransaction(
 				bytes,
 				message.payerKey.toBase58(),
 				message.instructions,
+				transaction.message.header.numRequiredSignatures,
+				{ kind: "versioned", tx: transaction },
 			);
 		} catch (cause) {
 			if (
@@ -508,6 +524,28 @@ function inspectSolanaTransaction(
 	}
 }
 
+/**
+ * Fail-closed ownership gate for native SOL transfers: the connected wallet must
+ * be the sole required signer, the fee payer, and the source of every transfer.
+ * Returning a non-null string means the request must be rejected before signing.
+ */
+function solanaOwnershipError(
+	inspection: SolanaTransactionInspection,
+	signerAddress: string | null,
+): string | null {
+	if (!signerAddress) {
+		return "No Solana wallet is connected to sign this request.";
+	}
+	if (
+		inspection.feePayer !== signerAddress ||
+		inspection.requiredSignatures !== 1 ||
+		inspection.transfers.some((transfer) => transfer.source !== signerAddress)
+	) {
+		return "Aomi Solana transaction is not fully owned by the connected signer: the fee payer and every transfer source must be the wallet, and it must be the only required signer.";
+	}
+	return null;
+}
+
 function solanaTransactionSummary(unsignedTx: string): string[] {
 	const inspection = inspectSolanaTransaction(unsignedTx);
 	return [
@@ -522,6 +560,26 @@ function solanaTransactionSummary(unsignedTx: string): string[] {
 		]),
 		`Payload: ${inspection.bytes.length} bytes, sha256:${inspection.digest}`,
 	];
+}
+
+/**
+ * A message is displayable only if every code point renders predictably. Besides
+ * C0 controls this rejects DEL, C1 controls, and bidi/zero-width code points that
+ * can make the confirmation preview read differently from the signed bytes.
+ */
+function isDisplayableMessageChar(code: number): boolean {
+	if (code === 0x09 || code === 0x0a || code === 0x0d) return true; // tab, LF, CR
+	if (code < 0x20) return false; // C0 controls
+	if (code === 0x7f) return false; // DEL
+	if (code >= 0x80 && code <= 0x9f) return false; // C1 controls
+	if (code === 0x061c) return false; // Arabic letter mark
+	if (code === 0x200b || code === 0x200c || code === 0x200d) return false; // zero-width
+	if (code === 0x200e || code === 0x200f) return false; // LRM / RLM
+	if (code >= 0x202a && code <= 0x202e) return false; // bidi embeddings / overrides
+	if (code >= 0x2060 && code <= 0x2064) return false; // word joiner / invisible ops
+	if (code >= 0x2066 && code <= 0x2069) return false; // bidi isolates
+	if (code === 0xfeff) return false; // zero-width no-break space / BOM
+	return true;
 }
 
 function decodeTransparentSolanaMessage(encodedMessage: string): {
@@ -544,10 +602,9 @@ function decodeTransparentSolanaMessage(encodedMessage: string): {
 	}
 	if (
 		text.length === 0 ||
-		[...text].some((character) => {
-			const code = character.codePointAt(0) ?? 0;
-			return code < 0x20 && character !== "\n" && character !== "\r";
-		})
+		[...text].some(
+			(character) => !isDisplayableMessageChar(character.codePointAt(0) ?? 0),
+		)
 	) {
 		throw new AomiError(
 			"Aomi Solana message contains non-displayable control bytes. Opaque message signing is blocked.",
@@ -574,61 +631,30 @@ async function signSolanaTransaction(
 		);
 	}
 	const inspection = inspectSolanaTransaction(payload.unsignedTx);
-	const bytes = inspection.bytes;
 	const signer = walletService(runtime).getWalletBackend().getSolanaSigner();
 	const signerAddress = signer.publicKey.toBase58();
-	if (
-		inspection.feePayer !== signerAddress ||
-		inspection.transfers.some((transfer) => transfer.source !== signerAddress)
-	) {
-		throw new AomiError(
-			"Aomi Solana transaction is not fully owned by the connected signer: the fee payer and every transfer source must match the wallet.",
-			{
-				code: "AOMI_SOLANA_SIGNER_MISMATCH",
-				context: {
-					signer: signerAddress,
-					feePayer: inspection.feePayer,
-					transferSources: inspection.transfers.map(
-						(transfer) => transfer.source,
-					),
-				},
-				severity: "fatal",
+	const ownershipError = solanaOwnershipError(inspection, signerAddress);
+	if (ownershipError) {
+		throw new AomiError(ownershipError, {
+			code: "AOMI_SOLANA_SIGNER_MISMATCH",
+			context: {
+				signer: signerAddress,
+				feePayer: inspection.feePayer,
+				requiredSignatures: inspection.requiredSignatures,
+				transferSources: inspection.transfers.map(
+					(transfer) => transfer.source,
+				),
 			},
-		);
+			severity: "fatal",
+		});
 	}
 
-	let versioned: VersionedTransaction | null = null;
-	try {
-		versioned = VersionedTransaction.deserialize(bytes);
-	} catch {
-		versioned = null;
-	}
-	if (versioned) {
-		const signed = await signer.signTransaction(versioned);
-		return Buffer.from(signed.serialize()).toString("base64");
-	}
-
-	let legacy: Transaction;
-	try {
-		legacy = Transaction.from(bytes);
-	} catch (cause) {
-		// error-policy:J2 Surface invalid legacy bytes after versioned decoding failed.
-		throw new AomiError(
-			"Aomi Solana transaction is neither a valid versioned nor legacy transaction.",
-			{
-				code: "AOMI_INVALID_SOLANA_REQUEST",
-				cause,
-				severity: "fatal",
-			},
-		);
-	}
-	const signed = await signer.signTransaction(legacy);
-	return Buffer.from(
-		signed.serialize({
-			requireAllSignatures: true,
-			verifySignatures: true,
-		}),
-	).toString("base64");
+	// Sign the exact object that was inspected. Because the wallet is the only
+	// required signer, the signature set is complete after signing; the legacy
+	// `serialize()` default (requireAllSignatures/verifySignatures) still guards.
+	const parsed = inspection.transaction;
+	const signed = await signer.signTransaction(parsed.tx);
+	return Buffer.from(signed.serialize()).toString("base64");
 }
 
 function solanaRpcUrl(runtime: IAgentRuntime, cluster?: string): string {
@@ -709,6 +735,7 @@ async function executeSolana(
 
 export function walletRequestSupportError(
 	request: WalletRequest,
+	wallet?: { readonly evm: string | null; readonly solana: string | null },
 ): string | null {
 	if (
 		request.kind === "transaction" &&
@@ -734,7 +761,15 @@ export function walletRequestSupportError(
 			if (!request.payload.unsignedTx) {
 				return "Aomi Solana request is missing unsigned transaction bytes.";
 			}
-			inspectSolanaTransaction(request.payload.unsignedTx);
+			const inspection = inspectSolanaTransaction(request.payload.unsignedTx);
+			// Reject foreign fee payers / transfer sources before confirmation, not
+			// only at signing time, so the user is never asked to approve a request
+			// that cannot be fulfilled. Skipped when the caller cannot supply the
+			// address (address-less callers still get the signing-time guard).
+			if (wallet !== undefined) {
+				const ownershipError = solanaOwnershipError(inspection, wallet.solana);
+				if (ownershipError) return ownershipError;
+			}
 		} catch (error) {
 			return error instanceof Error
 				? error.message
