@@ -23,6 +23,7 @@ import {
 
 const live = process.env.ELIZA_E2E_AOMI_SOLANA_WALLET === "1";
 const DEFAULT_DEVNET_RPC = "https://api.devnet.solana.com";
+const TRANSFER_LAMPORTS = 1_000_000;
 
 function evidenceKeypair(): Keypair {
 	const encoded = process.env.SOLANA_PRIVATE_KEY?.trim();
@@ -96,7 +97,7 @@ async function transferRequest(
 		SystemProgram.transfer({
 			fromPubkey: sender.publicKey,
 			toPubkey: recipient.publicKey,
-			lamports: 1,
+			lamports: TRANSFER_LAMPORTS,
 		}),
 	);
 	return {
@@ -123,15 +124,22 @@ describe.runIf(live)("Aomi Solana public-devnet execution", () => {
 		const sender = evidenceKeypair();
 		const recipient = Keypair.generate();
 
-		const airdropSignature = await connection.requestAirdrop(
+		let airdropSignature: string | null = null;
+		const initialBalance = await connection.getBalance(
 			sender.publicKey,
-			10_000_000,
-		);
-		const airdropConfirmation = await connection.confirmTransaction(
-			airdropSignature,
 			"confirmed",
 		);
-		expect(airdropConfirmation.value.err).toBeNull();
+		if (initialBalance < 10_000_000) {
+			airdropSignature = await connection.requestAirdrop(
+				sender.publicKey,
+				10_000_000 - initialBalance,
+			);
+			const airdropConfirmation = await connection.confirmTransaction(
+				airdropSignature,
+				"confirmed",
+			);
+			expect(airdropConfirmation.value.err).toBeNull();
+		}
 
 		const senderBefore = await connection.getBalance(
 			sender.publicKey,
@@ -168,7 +176,7 @@ describe.runIf(live)("Aomi Solana public-devnet execution", () => {
 			recipient.publicKey,
 			"confirmed",
 		);
-		expect(recipientAfter - recipientBefore).toBe(1);
+		expect(recipientAfter - recipientBefore).toBe(TRANSFER_LAMPORTS);
 		expect(senderAfter).toBeLessThan(senderBefore);
 
 		const emptySigner = Keypair.generate();
